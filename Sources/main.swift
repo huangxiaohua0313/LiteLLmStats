@@ -89,11 +89,28 @@ struct AppConfig {
     }
 }
 
-let configPath: String = {
-    let dir = NSHomeDirectory() + "/.litellm/menubar"
-    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    return dir + "/config.json"
+let dataDirPath: String = {
+    let dir = NSHomeDirectory() + "/.litellmStats"
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+
+    // 兼容旧版本数据目录 ~/.litellm/menubar
+    let legacyDir = NSHomeDirectory() + "/.litellm/menubar"
+    for name in ["config.json", "daily.json"] {
+        let src = legacyDir + "/" + name
+        let dst = dir + "/" + name
+        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { continue }
+        if (try? fm.copyItem(atPath: src, toPath: dst)) != nil {
+            try? fm.setAttributes([.posixPermissions: name == "config.json" ? 0o600 : 0o644],
+                                  ofItemAtPath: dst)
+        }
+    }
+    return dir
 }()
+
+let configPath = dataDirPath + "/config.json"
+let dailyPath = dataDirPath + "/daily.json"
 
 func loadConfig() -> AppConfig {
     var cfg = AppConfig()
@@ -435,9 +452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var usage: [String: ModelUsage] = [:]
     private var errorText: String?
     private var lastUpdated: Date?
-    private lazy var tracker = DailyUsageTracker(
-        path: NSHomeDirectory() + "/.litellm/menubar/daily.json"
-    )
+    private lazy var tracker = DailyUsageTracker(path: dailyPath)
 
     private var appVersion: String {
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
