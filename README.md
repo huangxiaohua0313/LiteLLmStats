@@ -2,67 +2,59 @@
 
 macOS 菜单栏上的 LiteLLM 用量监控小部件。实时显示**当天** token 消耗，点击展开各模型明细。
 
-当前版本：**0.3.0**
+当前版本：**1.0.0**
 
 ## 功能
 
 - 菜单栏实时显示「今日 x.xxM」
 - 按模型展示请求数、输入/输出 token、缓存命中率
+- 模型明细按 token 用量降序排列，用量相同再按请求次数降序
+- 可设置每日 token 限额，按 9:00–19:00 线性分配；菜单栏文字颜色随用量相对曲线的位置渐变（落后绿色/黄色，超前橙色/红色）
+- 从 LiteLLM 管理 API（数据库汇总）读取当天数据，无需 Prometheus
 - 网关地址（IP）与端口可配置
 - 刷新间隔可配置（2–3600 秒）
 - 访问密钥可配置；留空时自动读取 `~/.litellm/config.yaml` 中的 `master_key`
 - 支持开机自动启动（LaunchAgent）
-- 当日统计：跨零点自动归零；litellm 重启、计数器归零后仍继续累计当天用量
-- 指标查询超时 15 秒，失败自动重试 3 次
+- 当日统计：跨零点自动归零
+- 请求超时 15 秒，失败自动重试 3 次
 - 查询失败时继续显示本地缓存的今日用量，不清空菜单栏数据
-
-## 前置条件：LiteLLM 必须启用 Prometheus
-
-本应用完全依赖 LiteLLM 的 Prometheus 指标。**被监控的 LiteLLM 必须安装 prometheus 依赖并启用 prometheus 回调**，否则 `/metrics/` 会返回 404（或指标为空），应用显示不出任何数据。
-
-安装依赖（`proxy` extra 已包含 `prometheus_client`）：
-
-```bash
-pip install 'litellm[proxy]'
-# 或 pipx install 'litellm[proxy]'
-```
-
-在 LiteLLM 配置（`config.yaml`）中确认存在：
-
-```yaml
-litellm_settings:
-  callbacks: ["prometheus"]
-```
-
-修改后重启 LiteLLM 服务。验证（需使用 `master_key`，虚拟 key 无权限访问 `/metrics/`）：
-
-```bash
-curl -H "Authorization: Bearer <master_key>" http://<host>:<port>/metrics/
-```
-
-返回 200 且包含 `litellm_*` 指标即表示就绪。
-
-> 用 Docker 运行时，prometheus 指标同样来自上面的配置项，无需额外安装 Prometheus 服务——指标由 LiteLLM 自己以文本格式暴露在 `/metrics/`。
 
 ## 数据来源与统计口径
 
-应用读取 LiteLLM 的 Prometheus 指标接口：
+应用调用 LiteLLM 管理 API 获取当天用量。该接口由 LiteLLM 服务端按天汇总数据库中的 spend logs，**不依赖 Prometheus**。
+
+### 管理 API
 
 ```text
-GET http://<host>:<port>/metrics/
+GET http://<host>:<port>/user/daily/activity
+    ?start_date=YYYY-MM-DD
+    &end_date=YYYY-MM-DD
+    &timezone=-480
+    &include_current_utc_day=true
 Authorization: Bearer <master_key>
 ```
 
-Prometheus 计数器是进程启动以来的累计值。为了显示“当天”，应用：
+- 需要 LiteLLM 设置 `DATABASE_URL` 并开启 spend logs（连接数据库后默认记录）
+- 服务端直接按天汇总，无需本地换算
+- 按 `model_groups`（配置的模型别名）返回请求数、输入/输出/总 token、缓存读取 token
+- 日期按本机时区计算：`timezone` 使用 JavaScript `Date.getTimezoneOffset()` 约定（UTC+8 传 `-480`）
+- 数据来自数据库，**不受 litellm 重启影响**，应用当天启动得晚也不会丢已发生的用量
 
-1. 读取每类计数的 `litellm_*_metric_created`（计数器序列创建时间）；
-2. 若计数器是当天创建的，直接把当前值计为今日用量；
-3. 若计数器跨天，则按两次采样之间的增量累加；
-4. 若检测到计数器重建（litellm 重启），把新序列的当前值全部计入当天，同时保留重启前已累计的部分；
-5. 本地跨过零点时自动清空。
-6. 当日状态持久化在 `~/.litellmStats/daily.json`，应用重启不会丢失。
+验证（需 `master_key`）：
 
-已知边界：如果 LiteLLM 进程跨天运行，而本应用在当天零点之后才首次启动，那么“零点到应用启动前、且来自跨天旧计数器”的用量无法从纯计数器反推。
+```bash
+curl -H "Authorization: Bearer <master_key>" \
+  "http://<host>:<port>/user/daily/activity?start_date=$(date +%F)&end_date=$(date +%F)&timezone=-480"
+```
+
+### 前置条件
+
+被监控的 LiteLLM 需要满足：
+
+1. 配置 `DATABASE_URL`，且不要关闭 spend logs（连接数据库后默认记录）；
+2. 使用可访问该接口的 `master_key`（虚拟 key 无权限）。
+
+不需要安装或启用 Prometheus，也不需要 `callbacks: ["prometheus"]`。
 
 ## 构建
 
@@ -81,7 +73,7 @@ open dist/LiteLLmStats.app
 ./packaging/build-pkg.sh
 ```
 
-产物：`dist/LiteLLmStats-0.3.0.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
+产物：`dist/LiteLLmStats-1.0.0.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
 
 安装包会：
 
@@ -107,15 +99,35 @@ open dist/LiteLLmStats.app
 | 网关地址 / IP | LiteLLM 所在主机，默认 `127.0.0.1` |
 | 端口 | 默认 `4000` |
 | 刷新间隔(秒) | 2–3600，默认 `10` |
+| 每日 Token 限制 | 当天 token 总用量上限，默认 `100m`；留空或 `0` 表示不限；支持 `10m` / `500k` 写法 |
 | 访问密钥 | 留空则读取 `~/.litellm/config.yaml` 的 `master_key` |
 | 开机自动启动 | 写入/启用 LaunchAgent |
+
+### 每日限额曲线
+
+设置限额后，应用把限额按 **9:00–19:00 线性平均分配**，得到当前时刻的“应达用量”（曲线）：
+
+```text
+应达用量 = 限额 × (当前时刻 - 9:00) / 10 小时
+```
+
+9:00 前应达为 0，19:00 后应达等于限额。用 `实际用量 / 应达用量` 判断进度，菜单栏文字颜色连续渐变：
+
+| 比例 | 状态 | 颜色 |
+|---|---|---|
+| < 0.8 | 落后 | 绿色 |
+| 0.8–1.0 | 略落后 | 黄色 |
+| 1.0–1.2 | 超前 | 橙色 |
+| > 1.2 | 严重超前 | 红色 |
+
+各区间内保持纯色，分界处（0.8 / 1.0 / 1.2 附近）窄幅渐变过渡。9:00 前若已有用量，视为严重超前（红色）。菜单中“每日限额”一行会同时显示应达用量、当前占曲线比例和状态。
 
 数据目录：`~/.litellmStats/`（权限 0700）。
 
 | 文件 | 说明 |
 |---|---|
 | `~/.litellmStats/config.json` | 配置（权限 0600），参考 `config.example.json` |
-| `~/.litellmStats/daily.json` | 当日累计状态 |
+| `~/.litellmStats/usage-cache.json` | 最近一次成功查询的用量（查询失败时展示） |
 
 旧版本使用的 `~/.litellm/menubar/` 数据会在首次启动时自动迁移到新目录。
 
@@ -140,22 +152,22 @@ rm -rf ~/.litellmStats ~/.litellm/menubar
 
 分支命名统一为 `feature-x.y.z`，版本号按改动类型递增：
 
-| 改动类型 | 版本变化 | 示例（当前 `0.3.0`） |
+| 改动类型 | 版本变化 | 示例（当前 `1.0.0`） |
 |---|---|---|
-| 大功能 | 递增 `x` | `feature-1.0.0` |
-| 小功能更新 | 递增 `y` | `feature-0.4.0` |
-| 缺陷修复 | 递增 `z` | `feature-0.3.1` |
+| 大功能 | 递增 `x` | `feature-2.0.0` |
+| 小功能更新 | 递增 `y` | `feature-1.1.0` |
+| 缺陷修复 | 递增 `z` | `feature-1.0.1` |
 
 ```bash
 git checkout main
 git pull
-git checkout -b feature-0.4.0
+git checkout -b feature-1.1.0
 
 # 修改代码并提交
 git add -A
 git commit -m "feat: your feature"
 
-git push -u origin feature-0.4.0
+git push -u origin feature-1.1.0
 # 在 GitHub 创建 Pull Request，合并到 main
 ```
 
@@ -165,10 +177,11 @@ git push -u origin feature-0.4.0
 2. 执行 `./packaging/build-pkg.sh`
 3. 在 GitHub Releases 新建 `v<版本号>` tag，上传 `dist/LiteLLmStats-<版本号>.pkg`
 
-当前版本 `0.3.0` 的安装包：`LiteLLmStats-0.3.0.pkg`。
+当前版本 `1.0.0` 的安装包：`LiteLLmStats-1.0.0.pkg`。
 
 ## 版本
 
+- `1.0.0` — 当天用量改为完全由 LiteLLM 管理 API（数据库按天汇总）提供，移除 Prometheus 回退；新增本地用量缓存；模型明细按用量排序；新增每日 token 限额与 9:00–19:00 进度曲线配色
 - `0.3.0` — 指标查询超时调整为 15 秒、失败自动重试 3 次；查询失败时继续显示本地缓存的今日用量
 - `0.2.0` — 数据目录迁移到 `~/.litellmStats`（自动迁移旧数据）；README 补充 Prometheus 前置条件与分支命名规范
 - `0.1.0` — 首个对外版本：菜单栏今日用量、按模型明细、可配置网关/刷新/密钥、开机自启

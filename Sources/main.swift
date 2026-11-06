@@ -18,26 +18,6 @@ enum UsageMetricKey: String, CaseIterable {
     case requests, failed, input, output, total, cached, reasoning
 }
 
-let counterMetricNames: [String: UsageMetricKey] = [
-    "litellm_requests_metric_total": .requests,
-    "litellm_proxy_failed_requests_metric_total": .failed,
-    "litellm_input_tokens_metric_total": .input,
-    "litellm_output_tokens_metric_total": .output,
-    "litellm_total_tokens_metric_total": .total,
-    "litellm_input_cached_tokens_metric_total": .cached,
-    "litellm_output_reasoning_tokens_metric_total": .reasoning,
-]
-
-let createdMetricNames: [String: UsageMetricKey] = [
-    "litellm_requests_metric_created": .requests,
-    "litellm_proxy_failed_requests_metric_created": .failed,
-    "litellm_input_tokens_metric_created": .input,
-    "litellm_output_tokens_metric_created": .output,
-    "litellm_total_tokens_metric_created": .total,
-    "litellm_input_cached_tokens_metric_created": .cached,
-    "litellm_output_reasoning_tokens_metric_created": .reasoning,
-]
-
 extension ModelUsage {
     func value(for key: UsageMetricKey) -> Double {
         switch key {
@@ -64,12 +44,6 @@ extension ModelUsage {
     }
 }
 
-struct MetricsSnapshot {
-    var usage: [String: ModelUsage] = [:]
-    // 每个模型每类指标最早的 _created 时间戳（该计数从何时开始累加）
-    var created: [String: [String: Double]] = [:]
-}
-
 // MARK: - 配置
 
 struct AppConfig {
@@ -77,11 +51,26 @@ struct AppConfig {
     var port: Int = 4000
     var refreshSeconds: Int = 10
     var apiKey: String = ""
+    /// 每日 token 限额，0 表示不限制
+    var dailyTokenLimit: Int = 100_000_000
 
-    var metricsURL: URL? {
+    /// LiteLLM 管理 API：按天汇总的用量（需要 litellm 连接数据库并开启 spend logs）
+    var dailyActivityURL: URL? {
         // IPv6 字面量需要方括号
         let hostPart = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
-        return URL(string: "http://\(hostPart):\(port)/metrics/")
+        guard var components = URLComponents(string: "http://\(hostPart):\(port)/user/daily/activity") else {
+            return nil
+        }
+        let today = localDateKey()
+        // timezone 采用 JS Date.getTimezoneOffset() 约定：UTC+8 为 -480
+        let tzOffset = -(TimeZone.current.secondsFromGMT(for: Date()) / 60)
+        components.queryItems = [
+            URLQueryItem(name: "start_date", value: today),
+            URLQueryItem(name: "end_date", value: today),
+            URLQueryItem(name: "timezone", value: String(tzOffset)),
+            URLQueryItem(name: "include_current_utc_day", value: "true"),
+        ]
+        return components.url
     }
 
     var endpointDescription: String {
@@ -97,20 +86,56 @@ let dataDirPath: String = {
 
     // 兼容旧版本数据目录 ~/.litellm/menubar
     let legacyDir = NSHomeDirectory() + "/.litellm/menubar"
-    for name in ["config.json", "daily.json"] {
-        let src = legacyDir + "/" + name
-        let dst = dir + "/" + name
-        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { continue }
-        if (try? fm.copyItem(atPath: src, toPath: dst)) != nil {
-            try? fm.setAttributes([.posixPermissions: name == "config.json" ? 0o600 : 0o644],
-                                  ofItemAtPath: dst)
-        }
+    let src = legacyDir + "/config.json"
+    let dst = dir + "/config.json"
+    if fm.fileExists(atPath: src), !fm.fileExists(atPath: dst),
+       (try? fm.copyItem(atPath: src, toPath: dst)) != nil {
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dst)
     }
     return dir
 }()
 
 let configPath = dataDirPath + "/config.json"
-let dailyPath = dataDirPath + "/daily.json"
+let usageCachePath = dataDirPath + "/usage-cache.json"
+
+/// 最近一次成功查询的结果，查询失败时用它在菜单栏继续展示
+struct UsageCacheFile: Codable {
+    var date: String
+    var usage: [String: [String: Double]]
+}
+
+func saveUsageCache(_ usage: [String: ModelUsage]) {
+    var encoded: [String: [String: Double]] = [:]
+    for (alias, model) in usage {
+        var values: [String: Double] = [:]
+        for key in UsageMetricKey.allCases {
+            values[key.rawValue] = model.value(for: key)
+        }
+        encoded[alias] = values
+    }
+    let file = UsageCacheFile(date: localDateKey(), usage: encoded)
+    guard let data = try? JSONEncoder().encode(file) else { return }
+    try? data.write(to: URL(fileURLWithPath: usageCachePath), options: .atomic)
+}
+
+func loadUsageCache() -> [String: ModelUsage]? {
+    guard let data = FileManager.default.contents(atPath: usageCachePath),
+          let file = try? JSONDecoder().decode(UsageCacheFile.self, from: data),
+          file.date == localDateKey() else {
+        return nil
+    }
+    var usage: [String: ModelUsage] = [:]
+    for (alias, values) in file.usage {
+        let model = ModelUsage()
+        for key in UsageMetricKey.allCases {
+            model.set(key, values[key.rawValue] ?? 0)
+        }
+        if model.requests > 0 || model.total > 0 {
+            usage[alias] = model
+        }
+    }
+    return usage
+}
 
 func loadConfig() -> AppConfig {
     var cfg = AppConfig()
@@ -123,6 +148,7 @@ func loadConfig() -> AppConfig {
     if let port = obj["port"] as? Int, (1...65535).contains(port) { cfg.port = port }
     if let seconds = obj["refresh_seconds"] as? Int, seconds >= 2 { cfg.refreshSeconds = seconds }
     if let key = obj["api_key"] as? String { cfg.apiKey = key }
+    if let limit = obj["daily_token_limit"] as? Int, limit >= 0 { cfg.dailyTokenLimit = limit }
     return cfg
 }
 
@@ -133,6 +159,8 @@ func saveConfig(_ cfg: AppConfig) {
         "refresh_seconds": cfg.refreshSeconds
     ]
     if !cfg.apiKey.isEmpty { obj["api_key"] = cfg.apiKey }
+    // 始终写入，0 表示明确关闭限额
+    obj["daily_token_limit"] = cfg.dailyTokenLimit
 
     guard let data = try? JSONSerialization.data(withJSONObject: obj,
                                                  options: [.prettyPrinted, .sortedKeys]) else {
@@ -262,189 +290,81 @@ func setAutostart(enabled: Bool) {
     }
 }
 
-// MARK: - Prometheus 文本解析
-
-func parseLabelPairs(_ text: String) -> [String: String] {
-    var result: [String: String] = [:]
-    let pattern = #"([A-Za-z_][A-Za-z0-9_]*)="([^"]*)""#
-    guard let re = try? NSRegularExpression(pattern: pattern) else { return result }
-    let ns = text as NSString
-    let matches = re.matches(in: text, range: NSRange(location: 0, length: ns.length))
-    for m in matches where m.numberOfRanges == 3 {
-        result[ns.substring(with: m.range(at: 1))] = ns.substring(with: m.range(at: 2))
-    }
-    return result
+func localDateKey(_ date: Date = Date()) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: date)
 }
 
-func parseMetrics(_ text: String) -> MetricsSnapshot {
-    var snapshot = MetricsSnapshot()
+// MARK: - 管理 API（/user/daily/activity）
 
-    text.enumerateLines { line, _ in
-        guard !line.hasPrefix("#"),
-              let open = line.firstIndex(of: "{"),
-              let close = line.lastIndex(of: "}") else { return }
+struct DailyActivityResponse: Decodable {
+    struct Metrics: Decodable {
+        let promptTokens: Double?
+        let completionTokens: Double?
+        let totalTokens: Double?
+        let cacheReadInputTokens: Double?
+        let apiRequests: Double?
+        let failedRequests: Double?
 
-        let name = String(line[..<open])
-        let labelText = String(line[line.index(after: open)..<close])
-        let valueText = line[line.index(after: close)...].trimmingCharacters(in: .whitespaces)
-        guard let value = Double(valueText) else { return }
-
-        let labels = parseLabelPairs(labelText)
-        var alias = labels["requested_model"] ?? ""
-        if alias.isEmpty || alias == "None" {
-            alias = labels["model"] ?? ""
-        }
-        guard !alias.isEmpty, alias != "None" else { return }
-
-        if let key = counterMetricNames[name] {
-            guard value != 0 else { return }
-            let usage = snapshot.usage[alias] ?? ModelUsage()
-            usage.set(key, usage.value(for: key) + value)
-            snapshot.usage[alias] = usage
-        } else if let key = createdMetricNames[name] {
-            guard value > 0 else { return }
-            var byMetric = snapshot.created[alias] ?? [:]
-            if byMetric[key.rawValue].map({ value < $0 }) ?? true {
-                byMetric[key.rawValue] = value
-            }
-            snapshot.created[alias] = byMetric
+        enum CodingKeys: String, CodingKey {
+            case promptTokens = "prompt_tokens"
+            case completionTokens = "completion_tokens"
+            case totalTokens = "total_tokens"
+            case cacheReadInputTokens = "cache_read_input_tokens"
+            case apiRequests = "api_requests"
+            case failedRequests = "failed_requests"
         }
     }
 
-    return snapshot
+    struct Group: Decodable {
+        let metrics: Metrics?
+    }
+
+    struct Breakdown: Decodable {
+        let modelGroups: [String: Group]?
+
+        enum CodingKeys: String, CodingKey {
+            case modelGroups = "model_groups"
+        }
+    }
+
+    struct Result: Decodable {
+        let date: String
+        let breakdown: Breakdown?
+    }
+
+    let results: [Result]?
 }
 
-// MARK: - 今日用量（把 Prometheus 累计计数换算成当天用量）
-
-final class DailyUsageTracker {
-    private struct MetricState: Codable {
-        var created: Double?   // 当前计数器序列的创建时间
-        var last: Double       // 上次读到的累计值
-        var acc: Double        // 今天累计（跨重启累加）
+/// 解析当天各模型（按 model_group 别名）的用量。解析失败返回 nil。
+func parseDailyActivity(_ data: Data) -> [String: ModelUsage]? {
+    guard let response = try? JSONDecoder().decode(DailyActivityResponse.self, from: data),
+          let results = response.results else {
+        return nil
+    }
+    let today = localDateKey()
+    guard let result = results.first(where: { $0.date == today }) ?? results.first else {
+        return [:]   // 当天没有记录
     }
 
-    private struct Persisted: Codable {
-        var date: String
-        var state: [String: [String: MetricState]]
-    }
-
-    private let path: String
-    private var dateKey: String
-    private var state: [String: [String: MetricState]] = [:]
-
-    init(path: String) {
-        self.path = path
-        self.dateKey = Self.todayKey()
-        let dir = (path as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        load()
-    }
-
-    private static func todayKey(_ date: Date = Date()) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
-    }
-
-    private func midnightTimestamp() -> Double {
-        Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
-    }
-
-    private func rolloverIfNeeded() {
-        let today = Self.todayKey()
-        if today != dateKey {
-            dateKey = today
-            state = [:]
+    var usage: [String: ModelUsage] = [:]
+    for (alias, group) in result.breakdown?.modelGroups ?? [:] {
+        guard let metrics = group.metrics else { continue }
+        let model = ModelUsage()
+        model.requests = metrics.apiRequests ?? 0
+        model.failed = metrics.failedRequests ?? 0
+        model.input = metrics.promptTokens ?? 0
+        model.output = metrics.completionTokens ?? 0
+        model.total = metrics.totalTokens ?? 0
+        model.cached = metrics.cacheReadInputTokens ?? 0
+        if model.requests > 0 || model.total > 0 {
+            usage[alias] = model
         }
     }
-
-    /// 返回本地已保存的各模型“今天”用量（不访问网络）。
-    func currentUsage() -> [String: ModelUsage] {
-        rolloverIfNeeded()
-        var result: [String: ModelUsage] = [:]
-        for (alias, aliasState) in state {
-            let usage = ModelUsage()
-            for key in UsageMetricKey.allCases {
-                usage.set(key, aliasState[key.rawValue]?.acc ?? 0)
-            }
-            if usage.requests > 0 || usage.total > 0 || usage.input > 0 || usage.output > 0 {
-                result[alias] = usage
-            }
-        }
-        return result
-    }
-
-    /// 输入本次抓到的累计计数，返回各模型“今天”的用量。
-    func ingest(_ snapshot: MetricsSnapshot) -> [String: ModelUsage] {
-        rolloverIfNeeded()
-        let midnight = midnightTimestamp()
-
-        var result: [String: ModelUsage] = [:]
-
-        for (alias, rawUsage) in snapshot.usage {
-            var aliasState = state[alias] ?? [:]
-
-            for key in UsageMetricKey.allCases {
-                let value = rawUsage.value(for: key)
-                let created = snapshot.created[alias]?[key.rawValue]
-
-                let metricState: MetricState
-                if var existing = aliasState[key.rawValue] {
-                    if let c = created, let old = existing.created, c > old + 1 {
-                        // litellm 重启后计数器序列重建：今天新建的计数全量属于今天
-                        if c >= midnight { existing.acc += value }
-                        existing.created = c
-                        existing.last = value
-                    } else {
-                        // 同一计数取增量；数值变小说明计数器被重置
-                        let delta = value >= existing.last ? value - existing.last : value
-                        existing.acc += delta
-                        existing.last = value
-                        if existing.created == nil, let c = created { existing.created = c }
-                    }
-                    metricState = existing
-                } else if let c = created, c >= midnight {
-                    // 该计数今天才创建，当前累计值全部是今天的
-                    metricState = MetricState(created: c, last: value, acc: value)
-                } else {
-                    // 计数跨天，无法区分今天之前的量，从当前值起算
-                    metricState = MetricState(created: created, last: value, acc: 0)
-                }
-
-                aliasState[key.rawValue] = metricState
-            }
-
-            state[alias] = aliasState
-
-            let today = ModelUsage()
-            for key in UsageMetricKey.allCases {
-                today.set(key, aliasState[key.rawValue]?.acc ?? 0)
-            }
-            if today.requests > 0 || today.total > 0 || today.input > 0 || today.output > 0 {
-                result[alias] = today
-            }
-        }
-
-        save()
-        return result
-    }
-
-    private func load() {
-        guard let data = FileManager.default.contents(atPath: path),
-              let persisted = try? JSONDecoder().decode(Persisted.self, from: data),
-              persisted.date == Self.todayKey() else {
-            return
-        }
-        state = persisted.state
-    }
-
-    private func save() {
-        let persisted = Persisted(date: dateKey, state: state)
-        guard let data = try? JSONEncoder().encode(persisted) else { return }
-        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
-    }
+    return usage
 }
 
 // MARK: - 格式化
@@ -459,6 +379,141 @@ func fmtCount(_ value: Double) -> String {
     String(format: "%.0f", value)
 }
 
+// MARK: - 每日限额曲线（9:00–19:00 线性分配）
+
+struct UsagePace {
+    let limit: Double
+    let actual: Double
+    let expected: Double
+}
+
+/// 按 9:00–19:00 线性分配每日限额，计算当前时刻的应达用量
+func usagePace(actual: Double, limit: Int, at date: Date = Date()) -> UsagePace? {
+    guard limit > 0 else { return nil }
+    let comps = Calendar.current.dateComponents([.hour, .minute, .second], from: date)
+    let hour = Double(comps.hour ?? 0)
+    let minute = Double(comps.minute ?? 0)
+    let second = Double(comps.second ?? 0)
+    let seconds = hour * 3600 + minute * 60 + second
+    let start = 9.0 * 3600
+    let end = 19.0 * 3600
+    let limitValue = Double(limit)
+    let expected: Double
+    if seconds <= start {
+        expected = 0
+    } else if seconds >= end {
+        expected = limitValue
+    } else {
+        expected = limitValue * (seconds - start) / (end - start)
+    }
+    return UsagePace(limit: limitValue, actual: actual, expected: expected)
+}
+
+/// 相对曲线的位置：<0.8 落后（绿），0.8–1.0 略落后（黄），1.0–1.2 超前（橙），>1.2 严重超前（红）
+func paceDescription(_ pace: UsagePace) -> String {
+    if pace.expected <= 0 {
+        return pace.actual > 0 ? "曲线未开始" : "等待 9:00"
+    }
+    let ratio = pace.actual / pace.expected
+    if ratio < 0.8 { return "落后" }
+    if ratio < 1.0 { return "略落后" }
+    if ratio <= 1.2 { return "超前" }
+    return "严重超前"
+}
+
+private struct PaceRGB {
+    let r: CGFloat
+    let g: CGFloat
+    let b: CGFloat
+}
+
+private let paceGreen = (light: PaceRGB(r: 0.11, g: 0.60, b: 0.27),
+                         dark: PaceRGB(r: 0.32, g: 0.85, b: 0.45))
+private let paceYellow = (light: PaceRGB(r: 0.55, g: 0.42, b: 0.00),
+                          dark: PaceRGB(r: 1.00, g: 0.84, b: 0.25))
+private let paceOrange = (light: PaceRGB(r: 0.62, g: 0.40, b: 0.10),
+                          dark: PaceRGB(r: 0.95, g: 0.66, b: 0.34))
+private let paceRed = (light: PaceRGB(r: 0.72, g: 0.16, b: 0.13),
+                       dark: PaceRGB(r: 0.90, g: 0.38, b: 0.35))
+
+// (比例, 浅色, 深色)：区间内保持纯色，分界处窄幅渐变
+private let paceColorStops: [(ratio: Double, light: PaceRGB, dark: PaceRGB)] = [
+    (0.00, paceGreen.light, paceGreen.dark),
+    (0.76, paceGreen.light, paceGreen.dark),
+    (0.84, paceYellow.light, paceYellow.dark),
+    (0.96, paceYellow.light, paceYellow.dark),
+    (1.04, paceOrange.light, paceOrange.dark),
+    (1.16, paceOrange.light, paceOrange.dark),
+    (1.24, paceRed.light, paceRed.dark),
+    (3.00, paceRed.light, paceRed.dark),
+]
+
+private func interpolatePaceRGB(_ ratio: Double, dark: Bool) -> PaceRGB {
+    let stops = paceColorStops
+    if ratio <= stops[0].ratio {
+        return dark ? stops[0].dark : stops[0].light
+    }
+    for i in 1..<stops.count {
+        let prev = stops[i - 1]
+        let next = stops[i]
+        guard ratio <= next.ratio else { continue }
+        let span = next.ratio - prev.ratio
+        let t = span > 0 ? CGFloat((ratio - prev.ratio) / span) : 0
+        let a = dark ? prev.dark : prev.light
+        let b = dark ? next.dark : next.light
+        return PaceRGB(r: a.r + (b.r - a.r) * t,
+                       g: a.g + (b.g - a.g) * t,
+                       b: a.b + (b.b - a.b) * t)
+    }
+    let last = stops[stops.count - 1]
+    return dark ? last.dark : last.light
+}
+
+/// 曲线尚未开始且没有用量时返回 nil（使用系统默认文字颜色）
+func paceColor(_ pace: UsagePace) -> NSColor? {
+    let ratio: Double
+    if pace.expected <= 0 {
+        guard pace.actual > 0 else { return nil }
+        ratio = 3.0
+    } else {
+        ratio = pace.actual / pace.expected
+    }
+    return NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let c = interpolatePaceRGB(ratio, dark: dark)
+        return NSColor(srgbRed: c.r, green: c.g, blue: c.b, alpha: 1)
+    }
+}
+
+/// 设置界面里的展示形式：100000000 -> 100m
+func formatTokenLimit(_ value: Int) -> String {
+    if value <= 0 { return "" }
+    if value % 1_000_000 == 0 { return "\(value / 1_000_000)m" }
+    if value % 1_000 == 0 { return "\(value / 1_000)k" }
+    return String(value)
+}
+
+/// 支持 10m / 500k 这类写法；空字符串或 0 表示不限制
+func parseTokenLimit(_ text: String) -> Int? {
+    var value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if value.isEmpty { return 0 }
+    var multiplier = 1.0
+    if value.hasSuffix("m") {
+        multiplier = 1_000_000
+        value.removeLast()
+    } else if value.hasSuffix("k") {
+        multiplier = 1_000
+        value.removeLast()
+    } else if value.hasSuffix("b") {
+        multiplier = 1_000_000_000
+        value.removeLast()
+    }
+    guard let number = Double(value), number.isFinite, number >= 0 else { return nil }
+    let result = number * multiplier
+    guard result < Double(Int.max) else { return nil }
+    return Int(result)
+}
+
 // MARK: - 应用
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -470,7 +525,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastUpdated: Date?
     private var isRefreshing = false
     private static let maxRetries = 3
-    private lazy var tracker = DailyUsageTracker(path: dailyPath)
 
     private var appVersion: String {
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
@@ -499,7 +553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         print("[LiteLLmStats] statusItem visible=\(statusItem.isVisible) button=\(statusItem.button != nil) policy=\(NSApp.activationPolicy().rawValue) config=\(config.endpointDescription) every=\(config.refreshSeconds)s")
 
         // 先用本地持久化数据渲染，查询失败时也能显示上次用量
-        usage = tracker.currentUsage()
+        usage = loadUsageCache() ?? [:]
         updateStatusTitle()
 
         scheduleTimer()
@@ -524,48 +578,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
+    /// 仅用于让限额行保持启用态，避免系统把彩色文字调灰
+    @objc private func noopAction() {}
+
+
     @objc private func showSettings() {
         let alert = NSAlert()
         alert.messageText = "LiteLLmStats \(appVersion) 设置"
-        alert.informativeText = "配置 LiteLLM 网关地址、刷新频率和访问密钥。"
+        alert.informativeText = "配置 LiteLLM 网关地址、刷新频率、每日限额和访问密钥。"
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
 
-        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 172))
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 204))
 
         func makeLabel(_ text: String, y: CGFloat) -> NSTextField {
             let label = NSTextField(labelWithString: text)
-            label.frame = NSRect(x: 0, y: y, width: 100, height: 20)
+            label.frame = NSRect(x: 0, y: y, width: 120, height: 20)
             label.alignment = .right
             return label
         }
 
         func makeField(_ value: String, y: CGFloat, placeholder: String = "") -> NSTextField {
             let field = NSTextField(string: value)
-            field.frame = NSRect(x: 110, y: y, width: 260, height: 24)
+            field.frame = NSRect(x: 130, y: y, width: 240, height: 24)
             field.placeholderString = placeholder
             field.font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize,
                                                      weight: .regular)
             return field
         }
 
-        let hostField = makeField(config.host, y: 140)
-        let portField = makeField(String(config.port), y: 108)
-        let intervalField = makeField(String(config.refreshSeconds), y: 76)
+        let hostField = makeField(config.host, y: 172)
+        let portField = makeField(String(config.port), y: 140)
+        let intervalField = makeField(String(config.refreshSeconds), y: 108)
+        let limitField = makeField(
+            formatTokenLimit(config.dailyTokenLimit),
+            y: 76, placeholder: "默认 100m，留空或 0 不限"
+        )
         let keyField = makeField(config.apiKey, y: 44,
                                  placeholder: "留空则读取 ~/.litellm/config.yaml")
 
         let autostartCheckbox = NSButton(checkboxWithTitle: "开机自动启动",
                                          target: nil, action: nil)
-        autostartCheckbox.frame = NSRect(x: 110, y: 10, width: 260, height: 20)
+        autostartCheckbox.frame = NSRect(x: 130, y: 10, width: 240, height: 20)
         autostartCheckbox.state = isAutostartEnabled() ? .on : .off
 
-        accessory.addSubview(makeLabel("网关地址 / IP", y: 142))
+        accessory.addSubview(makeLabel("网关地址 / IP", y: 174))
         accessory.addSubview(hostField)
-        accessory.addSubview(makeLabel("端口", y: 110))
+        accessory.addSubview(makeLabel("端口", y: 142))
         accessory.addSubview(portField)
-        accessory.addSubview(makeLabel("刷新间隔(秒)", y: 78))
+        accessory.addSubview(makeLabel("刷新间隔(秒)", y: 110))
         accessory.addSubview(intervalField)
+        accessory.addSubview(makeLabel("每日 Token 限制", y: 78))
+        accessory.addSubview(limitField)
         accessory.addSubview(makeLabel("访问密钥", y: 46))
         accessory.addSubview(keyField)
         accessory.addSubview(autostartCheckbox)
@@ -578,12 +642,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let port = Int(portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         let interval = Int(intervalField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        let limit = parseTokenLimit(limitField.stringValue)
 
-        guard !host.isEmpty, (1...65535).contains(port), (2...3600).contains(interval) else {
+        guard !host.isEmpty, (1...65535).contains(port), (2...3600).contains(interval),
+              let dailyLimit = limit else {
             let warning = NSAlert()
             warning.alertStyle = .warning
             warning.messageText = "配置无效"
-            warning.informativeText = "地址不能为空，端口范围 1-65535，刷新间隔 2-3600 秒。"
+            warning.informativeText = "地址不能为空，端口范围 1-65535，刷新间隔 2-3600 秒，每日限额需为非负数字（可写 10m / 500k，留空为不限）。"
             warning.runModal()
             return
         }
@@ -591,6 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         config.host = host
         config.port = port
         config.refreshSeconds = interval
+        config.dailyTokenLimit = dailyLimit
         config.apiKey = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         saveConfig(config)
 
@@ -605,70 +672,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         guard !isRefreshing else { return }
-        guard let url = config.metricsURL else {
-            print("[LiteLLmStats] error: invalid metrics url")
-            errorText = "网关地址配置无效"
-            updateStatusTitle()
-            return
-        }
         guard let key = resolveAPIKey(config) else {
             print("[LiteLLmStats] error: api key not found")
             errorText = "未配置访问密钥（config.json 或 config.yaml）"
             updateStatusTitle()
             return
         }
+        guard let url = config.dailyActivityURL else {
+            print("[LiteLLmStats] error: invalid api url")
+            errorText = "网关地址配置无效"
+            updateStatusTitle()
+            return
+        }
 
+        isRefreshing = true
+        startRequest(url: url, key: key, attempt: 0)
+    }
+
+    private func startRequest(url: URL, key: String, attempt: Int) {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 15
-        isRefreshing = true
-        performRequest(request, attempt: 0)
-    }
 
-    private func performRequest(_ request: URLRequest, attempt: Int) {
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self = self else { return }
 
                 let http = response as? HTTPURLResponse
-                let failed = error != nil || http?.statusCode != 200
-                if failed && attempt < Self.maxRetries {
-                    print("[LiteLLmStats] retry \(attempt + 1)/\(Self.maxRetries) after error: \(error?.localizedDescription ?? "http \(http?.statusCode ?? -1)")")
+                let status = http?.statusCode ?? -1
+                let failed = error != nil || status != 200
+                // 401/403/404/405 通常是配置或权限问题，重试没有意义
+                let definitiveError = [401, 403, 404, 405].contains(status)
+
+                if failed && !definitiveError && attempt < Self.maxRetries {
+                    print("[LiteLLmStats] retry \(attempt + 1)/\(Self.maxRetries) after error: \(error?.localizedDescription ?? "http \(status)")")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                        self.performRequest(request, attempt: attempt + 1)
+                        self.startRequest(url: url, key: key, attempt: attempt + 1)
                     }
                     return
                 }
 
-                self.isRefreshing = false
-
-                if let error = error {
-                    print("[LiteLLmStats] network error: \(error.localizedDescription)")
-                    self.errorText = error.localizedDescription
-                    self.updateStatusTitle()
-                    return
-                }
-                guard let http = http,
-                      http.statusCode == 200,
-                      let data = data,
-                      let text = String(data: data, encoding: .utf8) else {
-                    print("[LiteLLmStats] http error: \(String(describing: response))")
-                    self.errorText = "metrics 接口请求失败"
+                if failed {
+                    self.isRefreshing = false
+                    let message = error?.localizedDescription ?? "HTTP \(status)"
+                    print("[LiteLLmStats] api error: \(message)")
+                    self.errorText = message
                     self.updateStatusTitle()
                     return
                 }
 
-                let snapshot = parseMetrics(text)
-                self.usage = self.tracker.ingest(snapshot)
-                self.errorText = nil
-                self.lastUpdated = Date()
-                self.updateStatusTitle()
+                guard let data = data, let apiUsage = parseDailyActivity(data) else {
+                    self.isRefreshing = false
+                    print("[LiteLLmStats] api parse failed")
+                    self.errorText = "用量接口返回数据无法解析"
+                    self.updateStatusTitle()
+                    return
+                }
 
-                let t = self.totals()
-                let cumulative = snapshot.usage.values.reduce(0.0) { $0 + $1.total }
-                print("[LiteLLmStats] ok \(self.config.endpointDescription) today models=\(self.usage.count) requests=\(Int(t.req)) tokens=\(Int(t.total)) cached=\(Int(t.cached)) cumulative=\(Int(cumulative))")
+                self.usage = apiUsage
+                saveUsageCache(apiUsage)
+                self.finishSuccess()
             }
         }.resume()
+    }
+
+    private func finishSuccess() {
+        isRefreshing = false
+        errorText = nil
+        lastUpdated = Date()
+        updateStatusTitle()
+
+        let t = totals()
+        print("[LiteLLmStats] ok \(config.endpointDescription) today models=\(usage.count) requests=\(Int(t.req)) tokens=\(Int(t.total)) cached=\(Int(t.cached))")
+        if let pace = usagePace(actual: t.total, limit: config.dailyTokenLimit) {
+            let ratio = pace.expected > 0 ? pace.actual / pace.expected : 0
+            print("[LiteLLmStats] pace limit=\(Int(pace.limit)) expected=\(Int(pace.expected)) ratio=\(String(format: "%.2f", ratio)) state=\(paceDescription(pace))")
+        }
     }
 
     private func totals() -> (req: Double, failed: Double, input: Double, output: Double,
@@ -687,6 +766,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (req, failed, input, output, total, cached, reasoning)
     }
 
+    private func setStatusTitle(_ text: String, color: NSColor?) {
+        guard let button = statusItem.button else { return }
+        if let color = color {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize,
+                                                        weight: .regular)
+            button.attributedTitle = NSAttributedString(string: text, attributes: [
+                .font: font,
+                .foregroundColor: color,
+            ])
+        } else {
+            button.title = text
+        }
+    }
+
+    private func paceTooltipSuffix(for total: Double) -> String {
+        guard let pace = usagePace(actual: total, limit: config.dailyTokenLimit) else {
+            return ""
+        }
+        return String(format: " · 限额 %@（曲线应达 %@，%@）",
+                      fmtTokens(pace.limit), fmtTokens(pace.expected), paceDescription(pace))
+    }
+
     private func updateStatusTitle() {
         guard let button = statusItem.button else { return }
 
@@ -694,8 +795,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let t = totals()
             if t.total > 0 || t.req > 0 {
                 // 查询失败时继续显示本地保存的上次用量
-                button.title = " 今日 " + fmtTokens(t.total)
+                let pace = usagePace(actual: t.total, limit: config.dailyTokenLimit)
+                setStatusTitle(" 今日 " + fmtTokens(t.total), color: pace.flatMap(paceColor))
                 button.toolTip = "LiteLLM 指标不可用，显示本地缓存数据：\(errorText)"
+                    + paceTooltipSuffix(for: t.total)
             } else {
                 button.title = " ⚠︎"
                 button.toolTip = "LiteLLM 指标不可用：\(errorText)"
@@ -705,11 +808,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let t = totals()
         let cacheRate = t.input > 0 ? t.cached / t.input * 100 : 0
-        button.title = " 今日 " + fmtTokens(t.total)
+        let pace = usagePace(actual: t.total, limit: config.dailyTokenLimit)
+        setStatusTitle(" 今日 " + fmtTokens(t.total), color: pace.flatMap(paceColor))
         button.toolTip = String(
             format: "LiteLLM 今日用量 · %@ 次请求 · 输入 %@ / 输出 %@ · 缓存命中 %.1f%%",
             fmtCount(t.req), fmtTokens(t.input), fmtTokens(t.output), cacheRate
-        )
+        ) + paceTooltipSuffix(for: t.total)
     }
 
     // MARK: NSMenuDelegate
@@ -741,7 +845,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !usage.isEmpty {
             menu.addItem(.separator())
-            for alias in usage.keys.sorted() {
+            let sortedAliases = usage.keys.sorted { lhs, rhs in
+                let l = usage[lhs]!, r = usage[rhs]!
+                if l.total != r.total { return l.total > r.total }
+                if l.requests != r.requests { return l.requests > r.requests }
+                return lhs < rhs
+            }
+            for alias in sortedAliases {
                 let u = usage[alias]!
                 let cacheRate = u.input > 0 ? u.cached / u.input * 100 : 0
                 let title = String(
@@ -765,6 +875,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             totalsItem.isEnabled = false
             menu.addItem(totalsItem)
+
+            if let pace = usagePace(actual: t.total, limit: config.dailyTokenLimit) {
+                menu.addItem(.separator())
+                let percent = pace.expected > 0
+                    ? String(format: "%.0f%%", pace.actual / pace.expected * 100)
+                    : "—"
+                let title = String(
+                    format: "每日限额 %@ · 曲线应达 %@ · 当前占曲线 %@（%@）",
+                    fmtTokens(pace.limit), fmtTokens(pace.expected), percent,
+                    paceDescription(pace)
+                )
+                // 用空 action 保持启用态：禁用态会被系统整体调灰，黄色在灰色底上几乎看不清
+                let limitItem = NSMenuItem(title: title, action: #selector(noopAction),
+                                           keyEquivalent: "")
+                limitItem.target = self
+                limitItem.attributedTitle = NSAttributedString(
+                    string: title,
+                    attributes: [.foregroundColor: paceColor(pace) ?? NSColor.labelColor]
+                )
+                menu.addItem(limitItem)
+            }
         }
 
         menu.addItem(.separator())
