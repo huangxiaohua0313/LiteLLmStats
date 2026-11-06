@@ -152,7 +152,13 @@ rm -rf ~/.litellmStats ~/.litellm/menubar
 
 ## 开发流程
 
-`main` 分支受保护：**禁止直接提交，必须从特性分支通过 Pull Request 合并**。
+`main` 分支受保护：**任何人（包括仓库管理员）都不得直接向 `main` commit 或 push，必须从特性分支发起 Pull Request 合并**。
+
+任何修改（包括文档、注释、版本号）都必须执行：
+
+1. 从最新 `main` 创建 `feature-x.y.z` 分支；
+2. 在特性分支提交并 `push` 到 GitHub；
+3. 发起 PR 合并到 `main`。
 
 分支命名统一为 `feature-x.y.z`，版本号按改动类型递增：
 
