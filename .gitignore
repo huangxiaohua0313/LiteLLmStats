@@ -1,0 +1,6 @@
+.DS_Store
+dist/
+*.app/
+*.log
+config.json
+daily.json
