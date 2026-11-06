@@ -360,6 +360,22 @@ final class DailyUsageTracker {
         }
     }
 
+    /// 返回本地已保存的各模型“今天”用量（不访问网络）。
+    func currentUsage() -> [String: ModelUsage] {
+        rolloverIfNeeded()
+        var result: [String: ModelUsage] = [:]
+        for (alias, aliasState) in state {
+            let usage = ModelUsage()
+            for key in UsageMetricKey.allCases {
+                usage.set(key, aliasState[key.rawValue]?.acc ?? 0)
+            }
+            if usage.requests > 0 || usage.total > 0 || usage.input > 0 || usage.output > 0 {
+                result[alias] = usage
+            }
+        }
+        return result
+    }
+
     /// 输入本次抓到的累计计数，返回各模型“今天”的用量。
     func ingest(_ snapshot: MetricsSnapshot) -> [String: ModelUsage] {
         rolloverIfNeeded()
@@ -452,6 +468,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var usage: [String: ModelUsage] = [:]
     private var errorText: String?
     private var lastUpdated: Date?
+    private var isRefreshing = false
+    private static let maxRetries = 3
     private lazy var tracker = DailyUsageTracker(path: dailyPath)
 
     private var appVersion: String {
@@ -479,6 +497,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         print("[LiteLLmStats] statusItem visible=\(statusItem.isVisible) button=\(statusItem.button != nil) policy=\(NSApp.activationPolicy().rawValue) config=\(config.endpointDescription) every=\(config.refreshSeconds)s")
+
+        // 先用本地持久化数据渲染，查询失败时也能显示上次用量
+        usage = tracker.currentUsage()
+        updateStatusTitle()
 
         scheduleTimer()
         refresh()
@@ -582,6 +604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refresh() {
+        guard !isRefreshing else { return }
         guard let url = config.metricsURL else {
             print("[LiteLLmStats] error: invalid metrics url")
             errorText = "网关地址配置无效"
@@ -597,11 +620,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         var request = URLRequest(url: url)
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 5
+        request.timeoutInterval = 15
+        isRefreshing = true
+        performRequest(request, attempt: 0)
+    }
 
+    private func performRequest(_ request: URLRequest, attempt: Int) {
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+
+                let http = response as? HTTPURLResponse
+                let failed = error != nil || http?.statusCode != 200
+                if failed && attempt < Self.maxRetries {
+                    print("[LiteLLmStats] retry \(attempt + 1)/\(Self.maxRetries) after error: \(error?.localizedDescription ?? "http \(http?.statusCode ?? -1)")")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        self.performRequest(request, attempt: attempt + 1)
+                    }
+                    return
+                }
+
+                self.isRefreshing = false
 
                 if let error = error {
                     print("[LiteLLmStats] network error: \(error.localizedDescription)")
@@ -609,7 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateStatusTitle()
                     return
                 }
-                guard let http = response as? HTTPURLResponse,
+                guard let http = http,
                       http.statusCode == 200,
                       let data = data,
                       let text = String(data: data, encoding: .utf8) else {
@@ -652,8 +691,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem.button else { return }
 
         if let errorText = errorText {
-            button.title = " ⚠︎"
-            button.toolTip = "LiteLLM 指标不可用：\(errorText)"
+            let t = totals()
+            if t.total > 0 || t.req > 0 {
+                // 查询失败时继续显示本地保存的上次用量
+                button.title = " 今日 " + fmtTokens(t.total)
+                button.toolTip = "LiteLLM 指标不可用，显示本地缓存数据：\(errorText)"
+            } else {
+                button.title = " ⚠︎"
+                button.toolTip = "LiteLLM 指标不可用：\(errorText)"
+            }
             return
         }
 
@@ -674,7 +720,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let header = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         header.isEnabled = false
         if let errorText = errorText {
-            header.title = "⚠︎ \(errorText)"
+            header.title = usage.isEmpty
+                ? "⚠︎ \(errorText)"
+                : "⚠︎ \(errorText) · 显示本地缓存"
         } else if let lastUpdated = lastUpdated {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
