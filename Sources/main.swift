@@ -409,16 +409,16 @@ func usagePace(actual: Double, limit: Int, at date: Date = Date()) -> UsagePace?
     return UsagePace(limit: limitValue, actual: actual, expected: expected)
 }
 
-/// 相对曲线的位置：<0.8 落后（绿），0.8–1.0 略落后（黄），1.0–1.2 超前（橙），>1.2 严重超前（红）
+/// 限额余量描述：<0.8 充足（绿），0.8–1.0 勉强（黄），1.0–1.2 不足（橙），>1.2 严重不足（红）
 func paceDescription(_ pace: UsagePace) -> String {
     if pace.expected <= 0 {
-        return pace.actual > 0 ? "曲线未开始" : "等待 9:00"
+        return pace.actual > 0 ? "提前消耗" : "等待 9:00"
     }
     let ratio = pace.actual / pace.expected
-    if ratio < 0.8 { return "落后" }
-    if ratio < 1.0 { return "略落后" }
-    if ratio <= 1.2 { return "超前" }
-    return "严重超前"
+    if ratio < 0.8 { return "充足" }
+    if ratio < 1.0 { return "勉强" }
+    if ratio <= 1.2 { return "不足" }
+    return "严重不足"
 }
 
 private struct PaceRGB {
