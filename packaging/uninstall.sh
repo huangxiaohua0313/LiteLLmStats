@@ -11,6 +11,7 @@ sudo rm -rf "/Applications/LiteLLmStats.app"
 sudo rm -f "/Library/LaunchAgents/${LABEL}.plist"
 sudo pkgutil --forget "$BUNDLE_ID" 2>/dev/null || true
 
-rm -f "$HOME/.litellm/menubar/daily.json"
+rm -rf "$HOME/.litellmStats"
+rm -rf "$HOME/.litellm/menubar"
 
 echo "LiteLLmStats uninstalled."
