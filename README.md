@@ -6,7 +6,7 @@ macOS 菜单栏上的 LiteLLM 用量监控小部件。实时显示**当天** tok
   <img src="docs/screenshot.png" width="720" alt="LiteLLmStats 菜单栏与模型明细截图">
 </p>
 
-当前版本：**1.0.0**
+当前版本：**1.0.1**
 
 ## 功能
 
@@ -77,7 +77,7 @@ open dist/LiteLLmStats.app
 ./packaging/build-pkg.sh
 ```
 
-产物：`dist/LiteLLmStats-1.0.0.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
+产物：`dist/LiteLLmStats-1.0.1.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
 
 安装包会：
 
@@ -162,11 +162,11 @@ rm -rf ~/.litellmStats ~/.litellm/menubar
 
 分支命名统一为 `feature-x.y.z`，版本号按改动类型递增：
 
-| 改动类型 | 版本变化 | 示例（当前 `1.0.0`） |
+| 改动类型 | 版本变化 | 示例（当前 `1.0.1`） |
 |---|---|---|
 | 大功能 | 递增 `x` | `feature-2.0.0` |
 | 小功能更新 | 递增 `y` | `feature-1.1.0` |
-| 缺陷修复 | 递增 `z` | `feature-1.0.1` |
+| 缺陷修复 | 递增 `z` | `feature-1.0.2` |
 
 ```bash
 git checkout main
@@ -187,10 +187,11 @@ git push -u origin feature-1.1.0
 2. 执行 `./packaging/build-pkg.sh`
 3. 在 GitHub Releases 新建 `v<版本号>` tag，上传 `dist/LiteLLmStats-<版本号>.pkg`
 
-当前版本 `1.0.0` 的安装包：`LiteLLmStats-1.0.0.pkg`。
+当前版本 `1.0.1` 的安装包：`LiteLLmStats-1.0.1.pkg`。
 
 ## 版本
 
+- `1.0.1` — README 增加菜单截图；明确 main 分支保护规则：禁止直接提交，必须 push 特性分支并发起 PR
 - `1.0.0` — 当天用量改为完全由 LiteLLM 管理 API（数据库按天汇总）提供，移除 Prometheus 回退；新增本地用量缓存；模型明细按用量排序；新增每日 token 限额与 9:00–19:00 进度曲线配色
 - `0.3.0` — 指标查询超时调整为 15 秒、失败自动重试 3 次；查询失败时继续显示本地缓存的今日用量
 - `0.2.0` — 数据目录迁移到 `~/.litellmStats`（自动迁移旧数据）；README 补充 Prometheus 前置条件与分支命名规范
