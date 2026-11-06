@@ -2,6 +2,10 @@
 
 macOS 菜单栏上的 LiteLLM 用量监控小部件。实时显示**当天** token 消耗，点击展开各模型明细。
 
+<p align="center">
+  <img src="docs/screenshot.png" width="720" alt="LiteLLmStats 菜单栏与模型明细截图">
+</p>
+
 当前版本：**1.0.0**
 
 ## 功能
