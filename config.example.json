@@ -2,5 +2,6 @@
   "host": "127.0.0.1",
   "port": 4000,
   "refresh_seconds": 10,
+  "daily_token_limit": 100000000,
   "api_key": ""
 }
