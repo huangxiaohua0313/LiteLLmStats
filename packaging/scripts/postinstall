@@ -1,0 +1,25 @@
+#!/bin/bash
+set -e
+
+LABEL="local.llm.litellm-stats"
+SYSTEM_PLIST="/Library/LaunchAgents/${LABEL}.plist"
+
+# 迁移旧版本
+rm -rf "/Applications/LLMStats.app"
+
+CONSOLE_USER="$(stat -f%Su /dev/console)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "_mbsetupuser" ]; then
+    exit 0
+fi
+
+USER_ID="$(id -u "$CONSOLE_USER")"
+USER_PLIST="/Users/${CONSOLE_USER}/Library/LaunchAgents/${LABEL}.plist"
+
+# 同一 Label 的用户级 plist 会与系统级冲突，移除旧安装残留
+rm -f "$USER_PLIST"
+
+launchctl asuser "$USER_ID" launchctl bootout "gui/${USER_ID}/${LABEL}" 2>/dev/null || true
+launchctl asuser "$USER_ID" launchctl enable "gui/${USER_ID}/${LABEL}" 2>/dev/null || true
+launchctl asuser "$USER_ID" launchctl bootstrap "gui/${USER_ID}" "$SYSTEM_PLIST" 2>/dev/null || true
+
+exit 0

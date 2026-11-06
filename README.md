@@ -45,6 +45,29 @@ open dist/LiteLLmStats.app
 
 产物：`dist/LiteLLmStats.app`（ad-hoc 签名，可直接本地运行）。
 
+## 打包 pkg
+
+```bash
+./packaging/build-pkg.sh
+```
+
+产物：`dist/LiteLLmStats-0.1.0.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
+
+安装包会：
+
+- 安装 `LiteLLmStats.app` 到 `/Applications/LiteLLmStats.app`
+- 安装 LaunchAgent 到 `/Library/LaunchAgents/local.llm.litellm-stats.plist`
+- 安装后自动为当前登录用户加载开机自启服务
+- 清理旧版本 `/Applications/LLMStats.app` 和冲突的用户级 LaunchAgent
+
+双击安装即可。未签名安装包如被 Gatekeeper 拦截，可在「系统设置 → 隐私与安全性」中点击「仍要打开」。
+
+卸载（需要管理员密码）：
+
+```bash
+./packaging/uninstall.sh
+```
+
 ## 配置
 
 点击菜单栏图标 → **设置…**，可修改：
@@ -73,6 +96,31 @@ rm -rf ~/.litellm/menubar/daily.json
 ```
 
 > 应用使用 `LSUIElement`，只驻留菜单栏，不显示在 Dock 和启动台。
+
+## 开发流程
+
+`main` 分支受保护：**禁止直接提交，必须从特性分支通过 Pull Request 合并**。
+
+```bash
+git checkout main
+git pull
+git checkout -b feat/your-feature
+
+# 修改代码并提交
+git add -A
+git commit -m "feat: your feature"
+
+git push -u origin feat/your-feature
+# 在 GitHub 创建 Pull Request，合并到 main
+```
+
+## 发布
+
+1. 修改 `Resources/Info.plist` 中的版本号（`CFBundleShortVersionString` / `CFBundleVersion`）
+2. 执行 `./packaging/build-pkg.sh`
+3. 在 GitHub Releases 新建 `v<版本号>` tag，上传 `dist/LiteLLmStats-<版本号>.pkg`
+
+当前版本 `0.1.0` 的安装包：`LiteLLmStats-0.1.0.pkg`。
 
 ## 版本
 
