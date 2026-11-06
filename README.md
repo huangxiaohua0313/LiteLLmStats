@@ -2,7 +2,7 @@
 
 macOS 菜单栏上的 LiteLLM 用量监控小部件。实时显示**当天** token 消耗，点击展开各模型明细。
 
-当前版本：**0.1.0**
+当前版本：**0.2.0**
 
 ## 功能
 
@@ -79,7 +79,7 @@ open dist/LiteLLmStats.app
 ./packaging/build-pkg.sh
 ```
 
-产物：`dist/LiteLLmStats-0.1.0.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
+产物：`dist/LiteLLmStats-0.2.0.pkg`，版本号取自 `Resources/Info.plist` 的 `CFBundleShortVersionString`。
 
 安装包会：
 
@@ -138,22 +138,22 @@ rm -rf ~/.litellmStats ~/.litellm/menubar
 
 分支命名统一为 `feature-x.y.z`，版本号按改动类型递增：
 
-| 改动类型 | 版本变化 | 示例（当前 `0.1.0`） |
+| 改动类型 | 版本变化 | 示例（当前 `0.2.0`） |
 |---|---|---|
 | 大功能 | 递增 `x` | `feature-1.0.0` |
-| 小功能更新 | 递增 `y` | `feature-0.2.0` |
-| 缺陷修复 | 递增 `z` | `feature-0.1.1` |
+| 小功能更新 | 递增 `y` | `feature-0.3.0` |
+| 缺陷修复 | 递增 `z` | `feature-0.2.1` |
 
 ```bash
 git checkout main
 git pull
-git checkout -b feature-0.2.0
+git checkout -b feature-0.3.0
 
 # 修改代码并提交
 git add -A
 git commit -m "feat: your feature"
 
-git push -u origin feature-0.2.0
+git push -u origin feature-0.3.0
 # 在 GitHub 创建 Pull Request，合并到 main
 ```
 
@@ -163,8 +163,9 @@ git push -u origin feature-0.2.0
 2. 执行 `./packaging/build-pkg.sh`
 3. 在 GitHub Releases 新建 `v<版本号>` tag，上传 `dist/LiteLLmStats-<版本号>.pkg`
 
-当前版本 `0.1.0` 的安装包：`LiteLLmStats-0.1.0.pkg`。
+当前版本 `0.2.0` 的安装包：`LiteLLmStats-0.2.0.pkg`。
 
 ## 版本
 
+- `0.2.0` — 数据目录迁移到 `~/.litellmStats`（自动迁移旧数据）；README 补充 Prometheus 前置条件与分支命名规范
 - `0.1.0` — 首个对外版本：菜单栏今日用量、按模型明细、可配置网关/刷新/密钥、开机自启
